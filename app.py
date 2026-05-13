@@ -1,15 +1,14 @@
 import streamlit as st
 import google.generativeai as genai
 import io
-import os
+import time
 from docx import Document
 
 # ----------------- CONFIGURACIÓN -----------------
-# La API Key de Gemini se toma de los secretos de Streamlit Cloud
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Modelo a utilizar (flash es rápido y económico)
+# Modelo a utilizar (flash tiene buena relación calidad/cupo gratuito)
 MODEL_NAME = "gemini-2.5-flash"
 
 # ----------------- PROMPT LEGAL PREDEFINIDO -----------------
@@ -57,48 +56,161 @@ FUENTES (VERDAD PROCESAL):
 {texto_base}
 """
 
-# ----------------- FUNCIÓN DE EXTRACCIÓN CON GEMINI -----------------
-
-def extraer_texto_con_gemini(file_bytes, mime_type):
-    """Envía el archivo directamente a Gemini para que extraiga el texto."""
-    model = genai.GenerativeModel(MODEL_NAME)
-    try:
-        response = model.generate_content([
-            {"mime_type": mime_type, "data": file_bytes},
-            "Extrae todo el texto de este documento, conservando las fechas, nombres y números tal cual aparecen."
-        ])
-        return response.text
-    except Exception as e:
-        st.error(f"Error al leer el archivo con Gemini: {e}")
-        return "[Error al extraer texto]"
+# ----------------- FUNCIONES DE EXTRACCIÓN -----------------
 
 def extraer_texto_docx(file_bytes):
-    """Extrae texto de un Word utilizando python-docx (en el servidor)."""
+    """Extrae texto de un Word (.docx) con python-docx."""
     try:
         doc = Document(io.BytesIO(file_bytes))
-        texto = "\n".join([para.text for para in doc.paragraphs])
-        return texto
+        return "\n".join([para.text for para in doc.paragraphs])
     except Exception as e:
-        st.error(f"Error al procesar Word: {e}")
-        return "[Error al extraer texto]"
+        raise RuntimeError(f"Error al procesar Word: {e}")
 
-# ----------------- LLAMADA PRINCIPAL A GEMINI -----------------
+def extraer_texto_varios_archivos(archivos_subidos, modelo):
+    """
+    Envía todos los archivos (PDF, imágenes) en una sola solicitud a Gemini
+    para extraer el texto. Así se evita exceder el límite gratuito de 5 RPM.
+    Retorna una lista de tuplas (nombre_archivo, texto_extraido).
+    Si un archivo es DOCX, se extrae localmente.
+    """
+    partes_solicitud = []
+    lista_docx = []  # (nombre, bytes) para procesar después
+    mapeo_indices = []  # para saber a qué nombre corresponde cada parte
 
-def generar_texto_legal(fuentes, texto_base):
-    prompt = PROMPT_PLANTILLA.format(fuentes=fuentes, texto_base=texto_base)
-    model = genai.GenerativeModel(MODEL_NAME)
+    for archivo in archivos_subidos:
+        nombre = archivo.name
+        mime = archivo.type
+        bytes_data = archivo.read()
+
+        if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            lista_docx.append((nombre, bytes_data))
+            continue  # se procesa aparte
+
+        # Solo PDF e imágenes van a Gemini
+        if mime not in ["application/pdf", "image/jpeg", "image/png", "image/jpg"]:
+            st.warning(f"Tipo de archivo no soportado: {nombre} ({mime})")
+            continue
+
+        try:
+            # Añadir parte con el archivo y una etiqueta para identificarlo
+            partes_solicitud.append({
+                "mime_type": mime,
+                "data": bytes_data
+            })
+            mapeo_indices.append(nombre)
+        except Exception as e:
+            st.warning(f"No se pudo leer el archivo {nombre}: {e}")
+
+    # Si no hay nada que enviar a Gemini, devolvemos solo los DOCX
+    if not partes_solicitud:
+        textos = []
+        for nombre, data in lista_docx:
+            try:
+                txt = extraer_texto_docx(data)
+                textos.append((nombre, txt))
+            except Exception as e:
+                st.warning(f"Error con {nombre}: {e}")
+                textos.append((nombre, "[Error al extraer]"))
+        return textos
+
+    # Preparar mensaje para Gemini con todos los archivos
+    # Incluimos una instrucción clara para que devuelva el texto en un formato que podamos separar por documento
+    prompt_instrucciones = (
+        "Extrae TODO el texto de cada uno de los siguientes documentos, conservando fechas, nombres y números tal cual aparecen. "
+        "Devuelve el resultado en este formato EXACTO:\n\n"
+        "--- DOCUMENTO: nombre_real_del_archivo ---\n"
+        "[texto extraído]\n\n"
+        "Repite esa estructura para cada documento, en el mismo orden en que se proporcionan."
+    )
+
+    # Construir partes completas
+    contenido = [prompt_instrucciones] + partes_solicitud
+
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        respuesta = modelo.generate_content(contenido)
+        texto_completo = respuesta.text
     except Exception as e:
-        st.error(f"Error al generar el texto legal: {e}")
-        return None
+        error_str = str(e)
+        if "429" in error_str:
+            st.warning("Límite de cuota alcanzado incluso en la solicitud combinada. Esperando 20 segundos...")
+            time.sleep(20)
+            try:
+                respuesta = modelo.generate_content(contenido)
+                texto_completo = respuesta.text
+            except Exception as e2:
+                st.error(f"Error definitivo al extraer texto con Gemini: {e2}")
+                # Devolver lo que tengamos de DOCX
+                textos = []
+                for nombre, data in lista_docx:
+                    try:
+                        txt = extraer_texto_docx(data)
+                        textos.append((nombre, txt))
+                    except:
+                        textos.append((nombre, "[Error]"))
+                return textos
+        else:
+            st.error(f"Error al extraer texto con Gemini: {e}")
+            textos = []
+            for nombre, data in lista_docx:
+                try:
+                    txt = extraer_texto_docx(data)
+                    textos.append((nombre, txt))
+                except:
+                    textos.append((nombre, "[Error]"))
+            return textos
+
+    # Parsear la respuesta para separar por documentos
+    # Buscamos las marcas "--- DOCUMENTO: ... ---"
+    textos_resultantes = []
+    bloques = texto_completo.split("--- DOCUMENTO: ")
+    # El primer bloque puede estar vacío o contener texto antes del primer documento
+    if bloques and bloques[0].strip() == "":
+        bloques = bloques[1:]  # ignorar prefacio vacío
+
+    for bloque in bloques:
+        # Cada bloque debería tener el formato "nombre ---\ntexto"
+        if "---" in bloque:
+            partes = bloque.split("---", 1)
+            nombre = partes[0].strip()
+            texto = partes[1].strip() if len(partes) > 1 else ""
+            textos_resultantes.append((nombre, texto))
+        else:
+            # Si no coincide, lo tomamos como documento sin nombre claro
+            textos_resultantes.append(("Desconocido", bloque.strip()))
+
+    # Agregar los documentos DOCX procesados localmente
+    for nombre, data in lista_docx:
+        try:
+            txt = extraer_texto_docx(data)
+            textos_resultantes.append((nombre, txt))
+        except Exception as e:
+            st.warning(f"Error con Word {nombre}: {e}")
+            textos_resultantes.append((nombre, "[Error al extraer]"))
+
+    return textos_resultantes
+
+# ----------------- LLAMADA PRINCIPAL -----------------
+
+def generar_texto_legal(fuentes, texto_base, modelo):
+    prompt = PROMPT_PLANTILLA.format(fuentes=fuentes, texto_base=texto_base)
+    try:
+        respuesta = modelo.generate_content(prompt)
+        return respuesta.text
+    except Exception as e:
+        if "429" in str(e):
+            st.warning("Límite alcanzado. Reintentando en 20 segundos...")
+            time.sleep(20)
+            respuesta = modelo.generate_content(prompt)
+            return respuesta.text
+        else:
+            st.error(f"Error al generar texto legal: {e}")
+            return None
 
 # ----------------- INTERFAZ STREAMLIT -----------------
 
 st.set_page_config(page_title="Asistente Legal Procesal (Cloud)", layout="wide")
 st.title("⚖️ Asistente Legal Procesal (Nube)")
-st.markdown("Sustituye datos en plantillas legales según la verdad procesal extraída directamente por Gemini. **Sin instalaciones locales.**")
+st.markdown("Extrae texto de documentos (PDF, imágenes, Word) usando Gemini y genera un texto legal corregido según tus instrucciones.")
 
 col1, col2 = st.columns(2)
 
@@ -117,30 +229,21 @@ with col1:
 with col2:
     st.header("Resultado")
     if st.button("Procesar", type="primary", disabled=not (archivos_fuente and texto_base.strip())):
-        # Extraer texto de todos los archivos
-        with st.spinner("Extrayendo texto de los documentos con Gemini..."):
-            textos_fuentes = []
-            for archivo in archivos_fuente:
-                bytes_data = archivo.read()
-                mime = archivo.type
-                if mime == "application/pdf":
-                    txt = extraer_texto_con_gemini(bytes_data, "application/pdf")
-                elif mime in ["image/jpeg", "image/png", "image/jpg"]:
-                    txt = extraer_texto_con_gemini(bytes_data, mime)
-                elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                    txt = extraer_texto_docx(bytes_data)  # Word se procesa localmente (python-docx en servidor)
-                else:
-                    st.warning(f"Tipo no soportado: {mime}")
-                    continue
-                textos_fuentes.append(f"--- DOCUMENTO: {archivo.name} ---\n{txt}")
-            fuentes_completo = "\n\n".join(textos_fuentes)
+        with st.spinner("Extrayendo texto de todos los documentos con Gemini (una sola llamada)..."):
+            model = genai.GenerativeModel(MODEL_NAME)
+            # Extraer texto de todos los archivos en una sola solicitud
+            lista_textos = extraer_texto_varios_archivos(archivos_fuente, model)
+
+            # Construir el texto combinado para las fuentes
+            fuentes_completo = ""
+            for nombre, txt in lista_textos:
+                fuentes_completo += f"--- DOCUMENTO: {nombre} ---\n{txt}\n\n"
 
         with st.spinner("Generando texto legal (esto puede tomar unos segundos)..."):
-            resultado = generar_texto_legal(fuentes_completo, texto_base)
+            resultado = generar_texto_legal(fuentes_completo, texto_base, model)
 
         if resultado:
             st.success("Procesamiento completado.")
-            # Separar secciones esperadas
             if "Validación con Fuentes:" in resultado:
                 partes = resultado.split("Validación con Fuentes:", 1)
                 texto_generado = partes[0].replace("Texto Generado:", "").strip()
