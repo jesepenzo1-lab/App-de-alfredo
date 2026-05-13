@@ -10,7 +10,7 @@ GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Modelo a utilizar (flash es rápido y económico)
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-pro"
 
 # ----------------- PROMPT LEGAL PREDEFINIDO -----------------
 PROMPT_PLANTILLA = """
